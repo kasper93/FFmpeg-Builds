@@ -5,6 +5,7 @@ SCRIPT_COMMIT="266538011d2fc8ee875abed0be43a537d0e59743"
 
 ffbuild_enabled() {
     (( $(ffbuild_ffver) > 501 )) || return -1
+    [[ "${ADDINS_STR}" == *mpv* ]] && return -1
     return 0
 }
 

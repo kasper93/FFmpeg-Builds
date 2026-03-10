@@ -133,8 +133,14 @@ get_output() {
 
 export TODF="Dockerfile"
 
+# Source addins early so they can set BASEIMAGE, ENTRYSCRIPT, etc.
+for addin in "${ADDINS[@]}"; do
+    source addins/"${addin}.sh"
+done
+
 BASELAYER="base-layer"
-to_df "FROM ${REGISTRY}/${REPO}/base-${TARGET}:latest AS ${BASELAYER}"
+BASEIMAGE="${BASEIMAGE:-base-${TARGET}}"
+to_df "FROM ${REGISTRY}/${REPO}/${BASEIMAGE}:latest AS ${BASELAYER}"
 to_df "ENV TARGET=$TARGET VARIANT=$VARIANT REPO=$REPO ADDINS_STR=$ADDINS_STR FFVER=$(ffbuild_ffver)"
 to_df "COPY --link util/run_stage.sh /usr/bin/run_stage"
 
@@ -145,7 +151,7 @@ for addin in "${ADDINS[@]}"; do
 )
 done
 
-ENTRYSCRIPT="$(ls -1d scripts.d/* | tail -n 1)"
+ENTRYSCRIPT="${ENTRYSCRIPT:-$(ls -1d scripts.d/* | tail -n 1)}"
 declare -A FILLED_DEPS
 while true; do
     CURDEPS=($(get_filled_deps "$ENTRYSCRIPT" | sort -u))

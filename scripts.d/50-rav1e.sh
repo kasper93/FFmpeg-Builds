@@ -5,6 +5,7 @@ SCRIPT_COMMIT="564ae3b0007ae2b06893fd7166bf88c5a84c5b63"
 
 ffbuild_enabled() {
     [[ $TARGET == win32 ]] && return -1
+    [[ "${ADDINS_STR}" == *mpv* ]] && return -1
     return 0
 }
 
