@@ -1,0 +1,109 @@
+name: Disk probe
+
+# Throwaway experiment: how much can a job really write on a GitHub-hosted
+# runner, does deleting pre-installed software add to that, and what does the
+# "Free Disk-Space" step from build.yml actually cost.
+
+on:
+  workflow_dispatch:
+    inputs:
+      max_gb:
+        description: 'Give up after writing this many GB'
+        type: string
+        default: '140'
+
+jobs:
+  probe:
+    name: ${{ matrix.runner }} / cleanup=${{ matrix.cleanup }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-26.04, ubuntu-24.04-arm, ubuntu-26.04-arm]
+        cleanup: [none, serial, parallel]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - name: Environment
+        run: |
+          set -x
+          echo "ImageOS=$ImageOS ImageVersion=$ImageVersion"
+          uname -r; nproc; free -g
+          df -h
+          lsblk -o NAME,SIZE,TYPE,MOUNTPOINT,FSTYPE,DISC-GRAN,DISC-MAX,ROTA,MODEL,VENDOR || true
+          grep -E ' / | /mnt ' /proc/mounts || true
+          systemd-detect-virt || true
+          cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name /sys/class/dmi/id/chassis_asset_tag 2>/dev/null || true
+          sudo dmesg 2>/dev/null | grep -iE 'virtio|scsi|hv_|hyperv|nvme|sd[a-z]:' | head -20 || true
+          time sudo fstrim -v / || true
+          sudo du -sh /usr/local/lib/android /usr/local/.ghcup /opt/ghc /opt/hostedtoolcache /usr/share/dotnet /usr/share/swift /usr/lib/jvm /usr/local/share/powershell /usr/lib/google-cloud-sdk /var/lib/docker 2>/dev/null || true
+          docker images --format '{{.Repository}}:{{.Tag}} {{.Size}}'
+
+      - name: Cleanup (serial, exactly what build.yml does today)
+        if: matrix.cleanup == 'serial'
+        run: |
+          time (df -h && sudo apt-get clean && docker system prune -a -f && sudo rm -rf /opt/ghc /usr/local/.ghcup /usr/local/lib/android && df -h)
+
+      - name: Cleanup (parallel)
+        if: matrix.cleanup == 'parallel'
+        run: |
+          time (
+            docker system prune -a -f >/dev/null &
+            sudo rm -rf /opt/ghc /usr/local/.ghcup &
+            sudo rm -rf /usr/local/lib/android &
+            wait
+          )
+          df -h /
+
+      - name: Write random data until the disk gives up
+        run: |
+          set +e
+          mkdir -p "$HOME/probe"
+          start=$(date +%s)
+          for ((i=1; i<=${{ inputs.max_gb }}; i++)); do
+            dd if=/dev/urandom of="$HOME/probe/chunk$i" bs=16M count=64 status=none conv=fsync
+            rc=$?
+            avail=$(df --output=avail -BG / | tail -1 | tr -dc '0-9')
+            echo "written=${i}G rc=$rc avail=${avail}G elapsed=$(( $(date +%s) - start ))s"
+            [[ $rc -ne 0 ]] && break
+          done
+          df -h /
+          exit 0
+
+      - name: Delete the probe data and write again (is freed space reusable?)
+        run: |
+          set +e
+          time rm -rf "$HOME/probe"
+          df -h /
+          mkdir -p "$HOME/probe2"
+          for ((i=1; i<=20; i++)); do
+            dd if=/dev/urandom of="$HOME/probe2/chunk$i" bs=16M count=64 status=none conv=fsync || { echo "failed at ${i}G"; break; }
+          done
+          df -h /
+          rm -rf "$HOME/probe2"
+          exit 0
+
+  measure-pull:
+    name: build_ffmpeg-style pull of ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [win64-gpl, linux64-gpl]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Pull image and measure disk usage
+        run: |
+          set -x
+          df -h /
+          sudo du -sh /var/lib/docker
+          ( while true; do df --output=avail -BM / | tail -1 | tr -dc '0-9'; sleep 1; done ) > /tmp/df.log &
+          SAMPLER=$!
+          time docker pull ghcr.io/btbn/ffmpeg-builds/${{ matrix.image }}:latest
+          kill $SAMPLER
+          docker image inspect --format 'uncompressed image size: {{.Size}}' ghcr.io/btbn/ffmpeg-builds/${{ matrix.image }}:latest
+          docker system df
+          sudo du -sh /var/lib/docker
+          df -h /
+          echo "lowest free space seen during pull: $(sort -n /tmp/df.log | head -1) MB"
+          time docker system prune -a -f
+          df -h /
