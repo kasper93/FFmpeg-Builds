@@ -5,6 +5,8 @@ name: Disk probe
 # "Free Disk-Space" step from build.yml actually cost.
 
 on:
+  push:
+    branches: [disk-probe]
   workflow_dispatch:
     inputs:
       max_gb:
@@ -59,7 +61,7 @@ jobs:
           set +e
           mkdir -p "$HOME/probe"
           start=$(date +%s)
-          for ((i=1; i<=${{ inputs.max_gb }}; i++)); do
+          for ((i=1; i<=${{ inputs.max_gb || '140' }}; i++)); do
             dd if=/dev/urandom of="$HOME/probe/chunk$i" bs=16M count=64 status=none conv=fsync
             rc=$?
             avail=$(df --output=avail -BG / | tail -1 | tr -dc '0-9')
