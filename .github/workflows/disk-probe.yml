@@ -1,111 +1,189 @@
 name: Disk probe
 
-# Throwaway experiment: how much can a job really write on a GitHub-hosted
-# runner, does deleting pre-installed software add to that, and what does the
-# "Free Disk-Space" step from build.yml actually cost.
+# Throwaway experiment, round 2:
+#  - areas:     what is big on the runner image and how long each removal takes
+#  - fullbuild: peak disk usage of a pr.yml-style full build (makeimage.sh + build.sh)
+#  - targets:   peak disk usage of a build.yml-style target-variant build with
+#               a mode=max cache export
 
 on:
   push:
     branches: [disk-probe]
   workflow_dispatch:
-    inputs:
-      max_gb:
-        description: 'Give up after writing this many GB'
-        type: string
-        default: '140'
 
 jobs:
-  probe:
-    name: ${{ matrix.runner }} / cleanup=${{ matrix.cleanup }}
+  areas:
+    name: areas / ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         runner: [ubuntu-latest, ubuntu-26.04, ubuntu-24.04-arm, ubuntu-26.04-arm]
-        cleanup: [none, serial, parallel]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     steps:
-      - name: Environment
+      - name: Inventory
         run: |
-          set -x
           echo "ImageOS=$ImageOS ImageVersion=$ImageVersion"
-          uname -r; nproc; free -g
-          df -h
-          lsblk -o NAME,SIZE,TYPE,MOUNTPOINT,FSTYPE,DISC-GRAN,DISC-MAX,ROTA,MODEL,VENDOR || true
-          grep -E ' / | /mnt ' /proc/mounts || true
-          systemd-detect-virt || true
-          cat /sys/class/dmi/id/sys_vendor /sys/class/dmi/id/product_name /sys/class/dmi/id/chassis_asset_tag 2>/dev/null || true
-          sudo dmesg 2>/dev/null | grep -iE 'virtio|scsi|hv_|hyperv|nvme|sd[a-z]:' | head -20 || true
-          time sudo fstrim -v / || true
-          sudo du -sh /usr/local/lib/android /usr/local/.ghcup /opt/ghc /opt/hostedtoolcache /usr/share/dotnet /usr/share/swift /usr/lib/jvm /usr/local/share/powershell /usr/lib/google-cloud-sdk /var/lib/docker 2>/dev/null || true
+          df -h /
+          echo "== swap"
+          swapon --show || true
+          ls -la /swapfile /mnt/swapfile 2>/dev/null || true
+          echo "== directories >= 200 MB, depth <= 4"
+          sudo du -xh --max-depth=4 / 2>/dev/null | awk '{v=$1; u=substr(v,length(v)); n=substr(v,1,length(v)-1)+0; if (u=="G" || (u=="M" && n>=200)) print}' | sort -h | tail -120
+          echo "== hostedtoolcache breakdown"
+          sudo du -sh /opt/hostedtoolcache/* 2>/dev/null | sort -h
+          echo "== docker images"
           docker images --format '{{.Repository}}:{{.Tag}} {{.Size}}'
+          echo "== apt cache"
+          sudo du -sh /var/cache/apt /var/lib/apt/lists 2>/dev/null || true
 
-      - name: Cleanup (serial, exactly what build.yml does today)
-        if: matrix.cleanup == 'serial'
+      - name: Timed removal of candidates
         run: |
-          time (df -h && sudo apt-get clean && docker system prune -a -f && sudo rm -rf /opt/ghc /usr/local/.ghcup /usr/local/lib/android && df -h)
-
-      - name: Cleanup (parallel)
-        if: matrix.cleanup == 'parallel'
-        run: |
-          time (
-            docker system prune -a -f >/dev/null &
-            sudo rm -rf /opt/ghc /usr/local/.ghcup &
-            sudo rm -rf /usr/local/lib/android &
-            wait
-          )
+          free_mb() { df --output=avail -BM / | awk 'NR==2{print $1+0}'; }
+          rm_timed() {
+            local before t0 t1 after
+            before=$(free_mb); t0=$(date +%s.%N)
+            sudo rm -rf "$@" 2>/dev/null
+            t1=$(date +%s.%N); after=$(free_mb)
+            printf "%-95s %7d MB %8.1f s\n" "$*" $((after-before)) "$(awk "BEGIN{print $t1-$t0}")"
+          }
+          echo "candidate | reclaimed | seconds"
+          rm_timed /usr/local/lib/android
+          rm_timed /usr/local/.ghcup /opt/ghc
+          rm_timed /opt/hostedtoolcache/CodeQL
+          rm_timed /opt/hostedtoolcache
+          rm_timed /usr/share/dotnet /usr/lib/dotnet /home/runner/.dotnet
+          rm_timed /usr/share/swift
+          rm_timed /usr/lib/jvm
+          rm_timed /usr/local/share/powershell
+          rm_timed /usr/lib/google-cloud-sdk
+          rm_timed /usr/local/share/chromium /usr/local/share/chromedriver-linux64 /opt/google /opt/microsoft /usr/lib/firefox /usr/local/share/edge_driver /usr/local/share/gecko_driver
+          rm_timed /usr/local/share/vcpkg
+          rm_timed /usr/share/miniconda
+          rm_timed /usr/local/julia*
+          rm_timed /usr/local/aws-cli /usr/local/aws-sam-cli
+          rm_timed /usr/lib/mono
+          rm_timed /opt/az /usr/share/az_*
+          rm_timed /usr/lib/llvm-*
+          rm_timed /usr/local/n /usr/local/lib/node_modules
+          rm_timed /opt/pipx
+          rm_timed /usr/share/rust /home/runner/.rustup /home/runner/.cargo
+          rm_timed /usr/share/kotlinc /usr/share/gradle* /usr/share/apache-maven* /usr/share/sbt /usr/lib/heroku
+          rm_timed /usr/local/lib/lein /usr/local/graalvm
+          rm_timed /usr/share/php* /usr/lib/php
+          rm_timed /usr/local/bin/minikube /usr/local/bin/kubectl /usr/local/bin/oc /usr/local/bin/helm /usr/local/bin/packer /usr/local/bin/terraform /usr/local/bin/pulumi* /usr/local/bin/kustomize
+          rm_timed /var/cache/apt/archives
+          before=$(free_mb); t0=$(date +%s.%N)
+          docker system prune -a -f >/dev/null
+          printf "%-95s %7d MB %8.1f s\n" "docker system prune -a -f" $(( $(free_mb) - before )) "$(awk "BEGIN{print $(date +%s.%N)-$t0}")"
+          if swapon --show --noheadings | grep -q .; then
+            before=$(free_mb); t0=$(date +%s.%N)
+            sudo swapoff -a && sudo rm -f /swapfile /mnt/swapfile
+            printf "%-95s %7d MB %8.1f s\n" "swapoff -a && rm swapfile" $(( $(free_mb) - before )) "$(awk "BEGIN{print $(date +%s.%N)-$t0}")"
+          fi
           df -h /
 
-      - name: Write random data until the disk gives up
+      - name: What is still big
         run: |
-          set +e
-          mkdir -p "$HOME/probe"
-          start=$(date +%s)
-          for ((i=1; i<=${{ inputs.max_gb || '140' }}; i++)); do
-            dd if=/dev/urandom of="$HOME/probe/chunk$i" bs=16M count=64 status=none conv=fsync
-            rc=$?
-            avail=$(df --output=avail -BG / | tail -1 | tr -dc '0-9')
-            echo "written=${i}G rc=$rc avail=${avail}G elapsed=$(( $(date +%s) - start ))s"
-            [[ $rc -ne 0 ]] && break
-          done
-          df -h /
-          exit 0
+          sudo du -xh --max-depth=3 / 2>/dev/null | awk '{v=$1; u=substr(v,length(v)); n=substr(v,1,length(v)-1)+0; if (u=="G" || (u=="M" && n>=200)) print}' | sort -h | tail -60
 
-      - name: Delete the probe data and write again (is freed space reusable?)
-        run: |
-          set +e
-          time rm -rf "$HOME/probe"
-          df -h /
-          mkdir -p "$HOME/probe2"
-          for ((i=1; i<=20; i++)); do
-            dd if=/dev/urandom of="$HOME/probe2/chunk$i" bs=16M count=64 status=none conv=fsync || { echo "failed at ${i}G"; break; }
-          done
-          df -h /
-          rm -rf "$HOME/probe2"
-          exit 0
-
-  measure-pull:
-    name: build_ffmpeg-style pull of ${{ matrix.image }}
+  fullbuild:
+    name: pr.yml-style full build of ${{ matrix.target }} ${{ matrix.variant }}
     strategy:
       fail-fast: false
       matrix:
-        image: [win64-gpl, linux64-gpl]
+        include:
+          - target: win64
+            variant: gpl
+          - target: linux64
+            variant: gpl
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 340
     steps:
-      - name: Pull image and measure disk usage
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Install buildx
+        uses: docker/setup-buildx-action@v4
+        with:
+          buildkitd-config: .github/buildkit.toml
+          driver: docker
+      - name: Start disk sampler
         run: |
-          set -x
           df -h /
-          sudo du -sh /var/lib/docker
-          ( while true; do df --output=avail -BM / | tail -1 | tr -dc '0-9'; sleep 1; done ) > /tmp/df.log &
-          SAMPLER=$!
-          time docker pull ghcr.io/btbn/ffmpeg-builds/${{ matrix.image }}:latest
-          kill $SAMPLER
-          docker image inspect --format 'uncompressed image size: {{.Size}}' ghcr.io/btbn/ffmpeg-builds/${{ matrix.image }}:latest
+          nohup bash -c 'while true; do echo "$(date +%s) $(df --output=avail -BM / | awk "NR==2{print \$1+0}")"; sleep 5; done' > /tmp/df.log 2>/dev/null &
+          echo $! > /tmp/sampler.pid
+      - name: Build Image
+        run: ./makeimage.sh ${{ matrix.target }} ${{ matrix.variant }}
+        env:
+          QUICKBUILD: ''
+      - name: Checkpoint after makeimage
+        if: always()
+        run: |
+          echo "makeimage_end $(date +%s)" >> /tmp/marks.log
+          df -h /
           docker system df
-          sudo du -sh /var/lib/docker
+          sudo du -sh /var/lib/docker .cache .cache/* 2>/dev/null || true
+          docker images --format '{{.Repository}}:{{.Tag}} {{.Size}}'
+      - name: Build ffmpeg
+        run: ./build.sh ${{ matrix.target }} ${{ matrix.variant }}
+      - name: Report peak usage
+        if: always()
+        run: |
+          kill "$(cat /tmp/sampler.pid)" || true
+          echo "build_end $(date +%s)" >> /tmp/marks.log
           df -h /
-          echo "lowest free space seen during pull: $(sort -n /tmp/df.log | head -1) MB"
-          time docker system prune -a -f
+          start=$(head -1 /tmp/df.log | awk '{print $2}')
+          min=$(sort -k2 -n /tmp/df.log | head -1 | awk '{print $2}')
+          echo "free at start: ${start} MB, lowest: ${min} MB, peak usage: $(( start - min )) MB"
+          echo "== marks"; cat /tmp/marks.log
+          echo "== timeline (epoch free_MB, every ~2 min)"
+          awk 'NR%24==1' /tmp/df.log
+
+  targets:
+    name: build.yml-style target-variant build of win64 gpl
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Install buildx
+        uses: docker/setup-buildx-action@v4
+        with:
+          buildkitd-config: .github/buildkit.toml
+      - name: Start disk sampler
+        run: |
           df -h /
+          nohup bash -c 'while true; do echo "$(date +%s) $(df --output=avail -BM / | awk "NR==2{print \$1+0}")"; sleep 5; done' > /tmp/df.log 2>/dev/null &
+          echo $! > /tmp/sampler.pid
+      - name: Download sources and generate Dockerfile
+        run: |
+          export GITHUB_REPOSITORY=BtbN/FFmpeg-Builds
+          ./download.sh
+          ./generate.sh win64 gpl
+          echo "downloads_end $(date +%s)" >> /tmp/marks.log
+          du -sh .cache/downloads
+          df -h /
+      - name: Build target-variant image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          pull: true
+          push: false
+          provenance: false
+          tags: ghcr.io/btbn/ffmpeg-builds/win64-gpl:probe
+          outputs: type=image,push=false
+          cache-to: type=local,mode=max,dest=/tmp/buildcache
+      - name: Report peak usage
+        if: always()
+        run: |
+          kill "$(cat /tmp/sampler.pid)" || true
+          echo "build_end $(date +%s)" >> /tmp/marks.log
+          df -h /
+          docker buildx du 2>/dev/null | tail -3 || true
+          sudo du -sh /tmp/buildcache /var/lib/docker 2>/dev/null || true
+          start=$(head -1 /tmp/df.log | awk '{print $2}')
+          min=$(sort -k2 -n /tmp/df.log | head -1 | awk '{print $2}')
+          echo "free at start: ${start} MB, lowest: ${min} MB, peak usage: $(( start - min )) MB"
+          echo "== marks"; cat /tmp/marks.log
+          echo "== timeline (epoch free_MB, every ~2 min)"
+          awk 'NR%24==1' /tmp/df.log
