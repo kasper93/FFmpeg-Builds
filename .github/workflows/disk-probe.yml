@@ -1,8 +1,6 @@
 name: Disk probe
 
-# Round 3: cost of pulling the CI images from ghcr on demand versus
-# saving/loading them through a gzip tarball as FFmpeg-CI's docker image
-# cache does.
+# Round 4: can FFmpeg-CI's matrix job run on ubuntu-slim?
 
 on:
   push:
@@ -10,41 +8,27 @@ on:
   workflow_dispatch:
 
 jobs:
-  pull:
-    name: pull timing / ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        runner: [ubuntu-latest, ubuntu-24.04-arm]
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 40
+  slim:
+    name: ubuntu-slim capability check
+    runs-on: ubuntu-slim
+    timeout-minutes: 15
     steps:
-      - name: Pull on demand
+      - name: Tools the matrix job needs
         run: |
           set -x
-          if [[ "$(uname -m)" == "aarch64" ]]; then SUF=-arm; else SUF=; fi
-          docker system prune -a -f >/dev/null
-          time docker pull ghcr.io/btbn/ffmpeg-builds/base:latest$SUF
-          if [[ -z "$SUF" ]]; then
-            time docker pull ghcr.io/btbn/ffmpeg-builds/win64-gpl:latest
-            time docker pull ghcr.io/btbn/ffmpeg-builds/win64-gpl-9.0:latest
-          fi
-          docker image ls --format '{{.Repository}}:{{.Tag}} {{.Size}}'
-          docker system df
-      - name: Save and reload through a gzip tarball (what the cache does)
-        run: |
-          set -x
-          IMAGES=$(docker image ls --format '{{.Repository}}:{{.Tag}}' | grep -v '<none>')
-          time (docker image save $IMAGES | gzip > /tmp/images.tgz)
-          ls -la /tmp/images.tgz
-          docker system prune -a -f >/dev/null
-          time (gzip -d < /tmp/images.tgz | docker image load)
-          time (docker image save $IMAGES | zstd -T0 -1 > /tmp/images.tzst)
-          ls -la /tmp/images.tzst
-          docker system prune -a -f >/dev/null
-          time (zstd -d -T0 < /tmp/images.tzst | docker image load)
-      - name: Re-pull with images present (what force_pull costs)
-        run: |
-          set -x
-          if [[ "$(uname -m)" == "aarch64" ]]; then SUF=-arm; else SUF=; fi
-          time docker pull ghcr.io/btbn/ffmpeg-builds/base:latest$SUF
+          echo "ImageOS=$ImageOS ImageVersion=$ImageVersion"
+          nproc; free -g; df -h /
+          for t in bash curl jq xz unxz git gh node python3 docker base64 seq; do printf "%-8s %s\n" "$t" "$(command -v $t || echo MISSING)"; done
+          docker version 2>&1 | head -2 || true
+          VER="$(curl -s https://code.forgejo.org/api/v1/repos/forgejo/runner/releases/latest | jq .name -r | cut -c 2-)"
+          echo "forgejo runner version: $VER"
+          time (curl -Ls "https://code.forgejo.org/forgejo/runner/releases/download/v${VER}/forgejo-runner-${VER}-linux-amd64.xz" | unxz > runner)
+          chmod +x runner && ./runner --version
+          jq -cn --argjson c '2' '[range(1; $c+1) as $i | {"os":"windows-latest", "runner_id":$i}]'
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: actions/cache on ubuntu-slim
+        uses: actions/cache@v6
+        with:
+          key: slim-probe-${{ github.run_id }}
+          path: runner
